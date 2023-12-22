@@ -1602,7 +1602,6 @@ class BigBirdClassificationHead3_2(nn.Module):
 
         return y, feature, mask
 
-
 class BigBirdClassificationHead3_2_2(nn.Module):
     def __init__(self, config, hidden_num=512, feature_num=128, out_num=150):
         super().__init__()
@@ -1706,7 +1705,7 @@ class BigBirdClassificationHead3_4(nn.Module):
 
         return x, feature
 
-
+#########S-Transformer#########
 class BigBird3(nn.Module):
     def __init__(self, config=None, add_pooling_layer=False, feature_num=128, fusion=False, out_mask=False,
                  as_disc=False, out_num=150):
