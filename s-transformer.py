@@ -13,6 +13,416 @@ import inspect
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 
+#########S-Transformer#########
+class BigBird3(nn.Module):
+    def __init__(self, config=None, add_pooling_layer=False, feature_num=128, fusion=False, out_mask=False,
+                 as_disc=False, out_num=150):
+        super().__init__()
+        self.config = config
+        self.attention_type = self.config.attention_type
+        self.block_size = self.config.block_size
+        self.embeddings = BigBirdEmbeddings(config)
+        self.encoder = BigBirdEncoder(config)
+        self.out_mask = out_mask
+        if out_mask:
+            self.classifier = BigBirdClassificationHead3_2_2(config, feature_num=feature_num, out_num=out_num)
+        elif as_disc:
+            self.classifier = BigBirdClassificationHead3_3(config, feature_num=feature_num)
+        elif fusion:
+            self.classifier = BigBirdClassificationHead3_4(config, feature_num=feature_num)
+        else:
+            self.classifier = BigBirdClassificationHead3(config, feature_num=feature_num)
+        self.sig = nn.Sigmoid()
+        self.hardtanh = nn.Hardtanh(0, 1)
+        # self.w_sl = nn.Parameter(torch.cat([torch.zeros([300,1]),torch.ones([300,1])],dim=1))
+        if self.attention_type != "original_full" and config.add_cross_attention:
+            print(
+                "When using `BigBirdForCausalLM` as decoder, then `attention_type` must be `original_full`. Setting `attention_type=original_full`")
+            self.set_attention_type("original_full")
+        if add_pooling_layer:
+            self.pooler = nn.Linear(config.hidden_size, config.hidden_size)
+            self.activation = nn.Tanh()
+        else:
+            self.pooler = None
+            self.activation = None
+
+    def set_attention_type(self, value: str):
+        if value not in ["original_full", "block_sparse"]:
+            raise ValueError(
+                f"attention_type can only be set to either 'original_full' or 'block_sparse', but is {value}"
+            )
+        # attention type is already correctly set
+        if value == self.attention_type:
+            return
+        self.attention_type = value
+        self.encoder.set_attention_type(value)
+
+    def get_head_mask(
+            self, head_mask: Optional[Tensor], num_hidden_layers: int, is_attention_chunked: bool = False
+    ) -> Tensor:
+        """
+        Prepare the head mask if needed.
+
+        Args:
+            head_mask (:obj:`torch.Tensor` with shape :obj:`[num_heads]` or :obj:`[num_hidden_layers x num_heads]`, `optional`):
+                The mask indicating if we should keep the heads or not (1.0 for keep, 0.0 for discard).
+            num_hidden_layers (:obj:`int`):
+                The number of hidden layers in the model.
+            is_attention_chunked: (:obj:`bool`, `optional`, defaults to :obj:`False`):
+                Whether or not the attentions scores are computed by chunks or not.
+
+        Returns:
+            :obj:`torch.Tensor` with shape :obj:`[num_hidden_layers x batch x num_heads x seq_length x seq_length]` or
+            list with :obj:`[None]` for each layer.
+        """
+        if head_mask is not None:
+            head_mask = self._convert_head_mask_to_5d(head_mask, num_hidden_layers)
+            if is_attention_chunked is True:
+                head_mask = head_mask.unsqueeze(-1)
+        else:
+            head_mask = [None] * num_hidden_layers
+
+        return head_mask
+
+    def _convert_head_mask_to_5d(self, head_mask, num_hidden_layers):
+        """-> [num_hidden_layers x batch x num_heads x seq_length x seq_length]"""
+        if head_mask.dim() == 1:
+            head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+        elif head_mask.dim() == 2:
+            head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)  # We can specify head_mask for each layer
+        assert head_mask.dim() == 5, f"head_mask.dim != 5, instead {head_mask.dim()}"
+        head_mask = head_mask.to(dtype=self.dtype)  # switch to float if need + fp16 compatibility
+        return head_mask
+
+    def get_extended_attention_mask(self, attention_mask: Tensor, input_shape: Tuple[int], device) -> Tensor:
+
+        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
+        # ourselves in which case we just need to make it broadcastable to all heads.
+        if attention_mask.dim() == 3:
+            extended_attention_mask = attention_mask[:, None, :, :]
+        elif attention_mask.dim() == 2:
+            # Provided a padding mask of dimensions [batch_size, seq_length]
+            # - if the model is a decoder, apply a causal mask in addition to the padding mask
+            # - if the model is an encoder, make the mask broadcastable to [batch_size, num_heads, seq_length, seq_length]
+            if self.config.is_decoder:
+                batch_size, seq_length = input_shape
+                seq_ids = torch.arange(seq_length, device=device)
+                causal_mask = seq_ids[None, None, :].repeat(batch_size, seq_length, 1) <= seq_ids[None, :, None]
+                # in case past_key_values are used we need to add a prefix ones mask to the causal mask
+                # causal and attention masks must have same type with pytorch version < 1.3
+                causal_mask = causal_mask.to(attention_mask.dtype)
+
+                if causal_mask.shape[1] < attention_mask.shape[1]:
+                    prefix_seq_len = attention_mask.shape[1] - causal_mask.shape[1]
+                    causal_mask = torch.cat(
+                        [
+                            torch.ones(
+                                (batch_size, seq_length, prefix_seq_len), device=device, dtype=causal_mask.dtype
+                            ),
+                            causal_mask,
+                        ],
+                        axis=-1,
+                    )
+
+                extended_attention_mask = causal_mask[:, None, :, :] * attention_mask[:, None, None, :]
+            else:
+                extended_attention_mask = attention_mask[:, None, None, :]
+        else:
+            raise ValueError(
+                f"Wrong shape for input_ids (shape {input_shape}) or attention_mask (shape {attention_mask.shape})"
+            )
+
+        # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
+        # masked positions, this operation will create a tensor which is 0.0 for
+        # positions we want to attend and -10000.0 for masked positions.
+        # Since we are adding it to the raw scores before the softmax, this is
+        # effectively the same as removing these entirely.
+        extended_attention_mask = extended_attention_mask.to(dtype=torch.float32)  # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        return extended_attention_mask
+
+    def forward(
+            self,
+            input_ids=None,
+            w_sl=None,
+            width=None,
+            batch=None,
+            age_sex=None,
+            attention_mask=None,
+            feature_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            past_key_values=None,
+            use_cache=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+            output_embedding=False,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if self.config.is_decoder:
+            use_cache = use_cache if use_cache is not None else self.config.use_cache
+        else:
+            use_cache = False
+
+        if input_ids is not None and inputs_embeds is not None:
+            input_shape = (input_ids.size()[0], input_ids.size()[1] + inputs_embeds.size()[1])
+            # raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        batch_size, seq_length = input_shape
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+        # past_key_values_length
+        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+
+        if attention_mask is None:
+            # gate = F.sigmoid(w_sl)
+            # gate_mask = gate[:,0].repeat(batch_size,1)
+            # gate = F.gumbel_softmax(torch.cat([gate,1.0-gate],dim=1)*20, tau = 1, dim = 1, hard = False)
+            # attention_mask = gate[:,0].repeat(batch_size,1)
+
+            gate = F.gumbel_softmax(torch.cat([w_sl, 1.0 - w_sl], dim=1) * 10, tau=1, dim=1, hard=False)
+            attention_mask = self.hardtanh(gate[:, 0] * 1.2 - 0.1).repeat(batch_size, 1).detach()
+            gate_mask = gate[:, 0].repeat(batch_size, 1)
+            # if feature_mask is not None:
+            #     gate_mask = gate_mask * feature_mask
+            # gate = F.gumbel_softmax(torch.cat([w_sl,1.0-w_sl],dim=1)*20, tau = 1, dim = 1, hard = False)#
+            # #gate = self.hardtanh(gate*1.2 - 0.1)
+            # gate_mask = gate[:,0].repeat(batch_size,1)
+            # attention_mask = gate_mask.detach()
+
+        if token_type_ids is None:
+            if hasattr(self.embeddings, "token_type_ids"):
+                buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
+                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(batch_size, seq_length)
+                token_type_ids = buffered_token_type_ids_expanded
+            else:
+                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+
+        # in order to use block_sparse attention, sequence_length has to be at least
+        # bigger than all global attentions: 2 * block_size
+        # + sliding tokens: 3 * block_size
+        # + random tokens: 2 * num_random_blocks * block_size
+        max_tokens_to_attend = (5 + 2 * self.config.num_random_blocks) * self.config.block_size
+        if self.attention_type == "block_sparse" and seq_length <= max_tokens_to_attend:
+            # change attention_type from block_sparse to original_full
+            # sequence_length = input_ids.size(1) if input_ids is not None else inputs_embeds.size(1)
+            # logger.warning(
+            #     "Attention type 'block_sparse' is not possible if sequence_length: "
+            #     f"{sequence_length} <= num global tokens: 2 * config.block_size "
+            #     "+ min. num sliding tokens: 3 * config.block_size "
+            #     "+ config.num_random_blocks * config.block_size "
+            #     "+ additional buffer: config.num_random_blocks * config.block_size "
+            #     f"= {max_tokens_to_attend} with config.block_size "
+            #     f"= {self.config.block_size}, config.num_random_blocks "
+            #     f"= {self.config.num_random_blocks}."
+            #     "Changing attention type to 'original_full'..."
+            # )
+            self.set_attention_type("original_full")
+
+        if self.attention_type == "block_sparse":
+            (
+                padding_len,
+                input_ids,
+                attention_mask,
+                token_type_ids,
+                position_ids,
+                inputs_embeds,
+            ) = self._pad_to_block_size(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                pad_token_id=self.config.pad_token_id,
+            )
+        else:
+            padding_len = 0
+
+        if self.attention_type == "block_sparse":
+            blocked_encoder_mask, band_mask, from_mask, to_mask = self.create_masks_for_block_sparse_attn(
+                attention_mask, self.block_size
+            )
+            extended_attention_mask = None
+
+        elif self.attention_type == "original_full":
+            blocked_encoder_mask = None
+            band_mask = None
+            from_mask = None
+            to_mask = None
+            # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
+            # ourselves in which case we just need to make it broadcastable to all heads.
+            extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(
+                attention_mask, input_shape, device
+            )
+
+        else:
+            raise ValueError(
+                f"attention_type can either be original_full or block_sparse, but is {self.attention_type}"
+            )
+
+        # If a 2D or 3D attention mask is provided for the cross-attention
+        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+        if self.config.is_decoder and encoder_hidden_states is not None:
+            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+            if encoder_attention_mask is None:
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+        else:
+            encoder_extended_attention_mask = None
+
+        # Prepare head mask if needed
+        # 1.0 in head_mask indicate we keep the head
+        # attention_probs has shape bsz x n_heads x N x N
+        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
+        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+
+        embedding_output, inputs_embeds_output = self.embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            token_type_ids=token_type_ids,
+            inputs_embeds=inputs_embeds,
+            past_key_values_length=past_key_values_length,
+        )
+
+        if output_embedding:
+            embedding_output = torch.autograd.Variable(embedding_output, requires_grad=True)
+
+        encoder_outputs = self.encoder(
+            embedding_output,
+            attention_mask=extended_attention_mask.detach(),
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_extended_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            band_mask=band_mask,
+            from_mask=from_mask,
+            to_mask=to_mask,
+            blocked_encoder_mask=blocked_encoder_mask,
+            return_dict=return_dict,
+        )
+        sequence_output = encoder_outputs
+        if self.out_mask:
+            if age_sex is not None:
+                logits, feature, mask = self.classifier(sequence_output, gate_mask, age_sex)
+            else:
+                logits, feature, mask = self.classifier(sequence_output, gate_mask)
+            if output_embedding:
+                return logits, gate[:, 0], feature, mask, embedding_output
+            else:
+                return logits, gate[:, 0], feature, mask
+        else:
+            if age_sex is not None:
+                logits, feature = self.classifier(sequence_output, gate_mask, age_sex)
+            else:
+                logits, feature = self.classifier(sequence_output, gate_mask)
+            if output_embedding:
+                return logits, gate[:, 0], feature, embedding_output
+            else:
+                return logits, gate[:, 0], feature
+
+    @staticmethod
+    def create_masks_for_block_sparse_attn(attention_mask: torch.Tensor, block_size: int):
+
+        batch_size, seq_length = attention_mask.size()
+        assert (
+                seq_length % block_size == 0
+        ), f"Sequence length must be multiple of block size, but sequence length is {seq_length}, while block size is {block_size}."
+
+        def create_band_mask_from_inputs(from_blocked_mask, to_blocked_mask):
+            """
+            Create 3D attention mask from a 2D tensor mask.
+            Args:
+                from_blocked_mask: 2D Tensor of shape [batch_size,
+                from_seq_length//from_block_size, from_block_size].
+                to_blocked_mask: int32 Tensor of shape [batch_size,
+                to_seq_length//to_block_size, to_block_size].
+            Returns:
+                float Tensor of shape [batch_size, 1, from_seq_length//from_block_size-4, from_block_size,
+                3*to_block_size].
+            """
+            exp_blocked_to_pad = torch.cat(
+                [to_blocked_mask[:, 1:-3], to_blocked_mask[:, 2:-2], to_blocked_mask[:, 3:-1]], dim=2
+            )
+            band_mask = torch.einsum("blq,blk->blqk", from_blocked_mask[:, 2:-2], exp_blocked_to_pad)
+            band_mask.unsqueeze_(1)
+            return band_mask
+
+        blocked_encoder_mask = attention_mask.view(batch_size, seq_length // block_size, block_size)
+        band_mask = create_band_mask_from_inputs(blocked_encoder_mask, blocked_encoder_mask)
+
+        from_mask = attention_mask.view(batch_size, 1, seq_length, 1)
+        to_mask = attention_mask.view(batch_size, 1, 1, seq_length)
+
+        return blocked_encoder_mask, band_mask, from_mask, to_mask
+
+    def _pad_to_block_size(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            pad_token_id=None,
+    ):
+        """A helper function to pad tokens and mask to work with implementation of BigBird block-sparse attention."""
+        # padding
+        block_size = self.config.block_size
+
+        input_shape = input_ids.shape if input_ids is not None else inputs_embeds.shape
+        batch_size, seq_len = input_shape[:2]
+
+        padding_len = (block_size - seq_len % block_size) % block_size
+        if padding_len > 0:
+            # print(
+            #     f"Input ids are automatically padded from {seq_len} to {seq_len + padding_len} to be a multiple of "
+            #     f"`config.block_size`: {block_size}"
+            # )
+            if input_ids is not None:
+                input_ids = nn.functional.pad(input_ids, (0, padding_len), value=pad_token_id)
+            if position_ids is not None:
+                # pad with position_id = pad_token_id as in modeling_bigbird.BigBirdEmbeddings
+                position_ids = nn.functional.pad(position_ids, (0, padding_len), value=pad_token_id)
+            if inputs_embeds is not None:
+                input_ids_padding = inputs_embeds.new_full(
+                    (batch_size, padding_len),
+                    self.config.pad_token_id,
+                    dtype=torch.long,
+                )
+                inputs_embeds_padding = self.embeddings(input_ids_padding)
+                inputs_embeds = torch.cat([inputs_embeds, inputs_embeds_padding], dim=-2)
+            if attention_mask is not None:
+                attention_mask = nn.functional.pad(
+                    attention_mask, (0, padding_len), value=False
+                )  # no attention on the padding tokens
+            if token_type_ids is not None:
+                token_type_ids = nn.functional.pad(token_type_ids, (0, padding_len),
+                                                   value=0)  # pad with token_type_id = 0
+
+        return padding_len, input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds
+
+
 def gelu_new(x):
     """
     Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT). Also see
@@ -1704,416 +2114,6 @@ class BigBirdClassificationHead3_4(nn.Module):
         x = self.out_proj(x)
 
         return x, feature
-
-#########S-Transformer#########
-class BigBird3(nn.Module):
-    def __init__(self, config=None, add_pooling_layer=False, feature_num=128, fusion=False, out_mask=False,
-                 as_disc=False, out_num=150):
-        super().__init__()
-        self.config = config
-        self.attention_type = self.config.attention_type
-        self.block_size = self.config.block_size
-        self.embeddings = BigBirdEmbeddings(config)
-        self.encoder = BigBirdEncoder(config)
-        self.out_mask = out_mask
-        if out_mask:
-            self.classifier = BigBirdClassificationHead3_2_2(config, feature_num=feature_num, out_num=out_num)
-        elif as_disc:
-            self.classifier = BigBirdClassificationHead3_3(config, feature_num=feature_num)
-        elif fusion:
-            self.classifier = BigBirdClassificationHead3_4(config, feature_num=feature_num)
-        else:
-            self.classifier = BigBirdClassificationHead3(config, feature_num=feature_num)
-        self.sig = nn.Sigmoid()
-        self.hardtanh = nn.Hardtanh(0, 1)
-        # self.w_sl = nn.Parameter(torch.cat([torch.zeros([300,1]),torch.ones([300,1])],dim=1))
-        if self.attention_type != "original_full" and config.add_cross_attention:
-            print(
-                "When using `BigBirdForCausalLM` as decoder, then `attention_type` must be `original_full`. Setting `attention_type=original_full`")
-            self.set_attention_type("original_full")
-        if add_pooling_layer:
-            self.pooler = nn.Linear(config.hidden_size, config.hidden_size)
-            self.activation = nn.Tanh()
-        else:
-            self.pooler = None
-            self.activation = None
-
-    def set_attention_type(self, value: str):
-        if value not in ["original_full", "block_sparse"]:
-            raise ValueError(
-                f"attention_type can only be set to either 'original_full' or 'block_sparse', but is {value}"
-            )
-        # attention type is already correctly set
-        if value == self.attention_type:
-            return
-        self.attention_type = value
-        self.encoder.set_attention_type(value)
-
-    def get_head_mask(
-            self, head_mask: Optional[Tensor], num_hidden_layers: int, is_attention_chunked: bool = False
-    ) -> Tensor:
-        """
-        Prepare the head mask if needed.
-
-        Args:
-            head_mask (:obj:`torch.Tensor` with shape :obj:`[num_heads]` or :obj:`[num_hidden_layers x num_heads]`, `optional`):
-                The mask indicating if we should keep the heads or not (1.0 for keep, 0.0 for discard).
-            num_hidden_layers (:obj:`int`):
-                The number of hidden layers in the model.
-            is_attention_chunked: (:obj:`bool`, `optional`, defaults to :obj:`False`):
-                Whether or not the attentions scores are computed by chunks or not.
-
-        Returns:
-            :obj:`torch.Tensor` with shape :obj:`[num_hidden_layers x batch x num_heads x seq_length x seq_length]` or
-            list with :obj:`[None]` for each layer.
-        """
-        if head_mask is not None:
-            head_mask = self._convert_head_mask_to_5d(head_mask, num_hidden_layers)
-            if is_attention_chunked is True:
-                head_mask = head_mask.unsqueeze(-1)
-        else:
-            head_mask = [None] * num_hidden_layers
-
-        return head_mask
-
-    def _convert_head_mask_to_5d(self, head_mask, num_hidden_layers):
-        """-> [num_hidden_layers x batch x num_heads x seq_length x seq_length]"""
-        if head_mask.dim() == 1:
-            head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
-        elif head_mask.dim() == 2:
-            head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)  # We can specify head_mask for each layer
-        assert head_mask.dim() == 5, f"head_mask.dim != 5, instead {head_mask.dim()}"
-        head_mask = head_mask.to(dtype=self.dtype)  # switch to float if need + fp16 compatibility
-        return head_mask
-
-    def get_extended_attention_mask(self, attention_mask: Tensor, input_shape: Tuple[int], device) -> Tensor:
-
-        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
-        # ourselves in which case we just need to make it broadcastable to all heads.
-        if attention_mask.dim() == 3:
-            extended_attention_mask = attention_mask[:, None, :, :]
-        elif attention_mask.dim() == 2:
-            # Provided a padding mask of dimensions [batch_size, seq_length]
-            # - if the model is a decoder, apply a causal mask in addition to the padding mask
-            # - if the model is an encoder, make the mask broadcastable to [batch_size, num_heads, seq_length, seq_length]
-            if self.config.is_decoder:
-                batch_size, seq_length = input_shape
-                seq_ids = torch.arange(seq_length, device=device)
-                causal_mask = seq_ids[None, None, :].repeat(batch_size, seq_length, 1) <= seq_ids[None, :, None]
-                # in case past_key_values are used we need to add a prefix ones mask to the causal mask
-                # causal and attention masks must have same type with pytorch version < 1.3
-                causal_mask = causal_mask.to(attention_mask.dtype)
-
-                if causal_mask.shape[1] < attention_mask.shape[1]:
-                    prefix_seq_len = attention_mask.shape[1] - causal_mask.shape[1]
-                    causal_mask = torch.cat(
-                        [
-                            torch.ones(
-                                (batch_size, seq_length, prefix_seq_len), device=device, dtype=causal_mask.dtype
-                            ),
-                            causal_mask,
-                        ],
-                        axis=-1,
-                    )
-
-                extended_attention_mask = causal_mask[:, None, :, :] * attention_mask[:, None, None, :]
-            else:
-                extended_attention_mask = attention_mask[:, None, None, :]
-        else:
-            raise ValueError(
-                f"Wrong shape for input_ids (shape {input_shape}) or attention_mask (shape {attention_mask.shape})"
-            )
-
-        # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
-        # masked positions, this operation will create a tensor which is 0.0 for
-        # positions we want to attend and -10000.0 for masked positions.
-        # Since we are adding it to the raw scores before the softmax, this is
-        # effectively the same as removing these entirely.
-        extended_attention_mask = extended_attention_mask.to(dtype=torch.float32)  # fp16 compatibility
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-        return extended_attention_mask
-
-    def forward(
-            self,
-            input_ids=None,
-            w_sl=None,
-            width=None,
-            batch=None,
-            age_sex=None,
-            attention_mask=None,
-            feature_mask=None,
-            token_type_ids=None,
-            position_ids=None,
-            head_mask=None,
-            inputs_embeds=None,
-            encoder_hidden_states=None,
-            encoder_attention_mask=None,
-            past_key_values=None,
-            use_cache=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
-            output_embedding=False,
-    ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if self.config.is_decoder:
-            use_cache = use_cache if use_cache is not None else self.config.use_cache
-        else:
-            use_cache = False
-
-        if input_ids is not None and inputs_embeds is not None:
-            input_shape = (input_ids.size()[0], input_ids.size()[1] + inputs_embeds.size()[1])
-            # raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        elif input_ids is not None:
-            input_shape = input_ids.size()
-        elif inputs_embeds is not None:
-            input_shape = inputs_embeds.size()[:-1]
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
-
-        batch_size, seq_length = input_shape
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
-
-        # past_key_values_length
-        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
-
-        if attention_mask is None:
-            # gate = F.sigmoid(w_sl)
-            # gate_mask = gate[:,0].repeat(batch_size,1)
-            # gate = F.gumbel_softmax(torch.cat([gate,1.0-gate],dim=1)*20, tau = 1, dim = 1, hard = False)
-            # attention_mask = gate[:,0].repeat(batch_size,1)
-
-            gate = F.gumbel_softmax(torch.cat([w_sl, 1.0 - w_sl], dim=1) * 10, tau=1, dim=1, hard=False)
-            attention_mask = self.hardtanh(gate[:, 0] * 1.2 - 0.1).repeat(batch_size, 1).detach()
-            gate_mask = gate[:, 0].repeat(batch_size, 1)
-            # if feature_mask is not None:
-            #     gate_mask = gate_mask * feature_mask
-            # gate = F.gumbel_softmax(torch.cat([w_sl,1.0-w_sl],dim=1)*20, tau = 1, dim = 1, hard = False)#
-            # #gate = self.hardtanh(gate*1.2 - 0.1)
-            # gate_mask = gate[:,0].repeat(batch_size,1)
-            # attention_mask = gate_mask.detach()
-
-        if token_type_ids is None:
-            if hasattr(self.embeddings, "token_type_ids"):
-                buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
-                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(batch_size, seq_length)
-                token_type_ids = buffered_token_type_ids_expanded
-            else:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
-
-        # in order to use block_sparse attention, sequence_length has to be at least
-        # bigger than all global attentions: 2 * block_size
-        # + sliding tokens: 3 * block_size
-        # + random tokens: 2 * num_random_blocks * block_size
-        max_tokens_to_attend = (5 + 2 * self.config.num_random_blocks) * self.config.block_size
-        if self.attention_type == "block_sparse" and seq_length <= max_tokens_to_attend:
-            # change attention_type from block_sparse to original_full
-            # sequence_length = input_ids.size(1) if input_ids is not None else inputs_embeds.size(1)
-            # logger.warning(
-            #     "Attention type 'block_sparse' is not possible if sequence_length: "
-            #     f"{sequence_length} <= num global tokens: 2 * config.block_size "
-            #     "+ min. num sliding tokens: 3 * config.block_size "
-            #     "+ config.num_random_blocks * config.block_size "
-            #     "+ additional buffer: config.num_random_blocks * config.block_size "
-            #     f"= {max_tokens_to_attend} with config.block_size "
-            #     f"= {self.config.block_size}, config.num_random_blocks "
-            #     f"= {self.config.num_random_blocks}."
-            #     "Changing attention type to 'original_full'..."
-            # )
-            self.set_attention_type("original_full")
-
-        if self.attention_type == "block_sparse":
-            (
-                padding_len,
-                input_ids,
-                attention_mask,
-                token_type_ids,
-                position_ids,
-                inputs_embeds,
-            ) = self._pad_to_block_size(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                inputs_embeds=inputs_embeds,
-                pad_token_id=self.config.pad_token_id,
-            )
-        else:
-            padding_len = 0
-
-        if self.attention_type == "block_sparse":
-            blocked_encoder_mask, band_mask, from_mask, to_mask = self.create_masks_for_block_sparse_attn(
-                attention_mask, self.block_size
-            )
-            extended_attention_mask = None
-
-        elif self.attention_type == "original_full":
-            blocked_encoder_mask = None
-            band_mask = None
-            from_mask = None
-            to_mask = None
-            # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
-            # ourselves in which case we just need to make it broadcastable to all heads.
-            extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(
-                attention_mask, input_shape, device
-            )
-
-        else:
-            raise ValueError(
-                f"attention_type can either be original_full or block_sparse, but is {self.attention_type}"
-            )
-
-        # If a 2D or 3D attention mask is provided for the cross-attention
-        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
-        if self.config.is_decoder and encoder_hidden_states is not None:
-            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
-            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
-            if encoder_attention_mask is None:
-                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
-            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
-        else:
-            encoder_extended_attention_mask = None
-
-        # Prepare head mask if needed
-        # 1.0 in head_mask indicate we keep the head
-        # attention_probs has shape bsz x n_heads x N x N
-        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
-        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
-
-        embedding_output, inputs_embeds_output = self.embeddings(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            token_type_ids=token_type_ids,
-            inputs_embeds=inputs_embeds,
-            past_key_values_length=past_key_values_length,
-        )
-
-        if output_embedding:
-            embedding_output = torch.autograd.Variable(embedding_output, requires_grad=True)
-
-        encoder_outputs = self.encoder(
-            embedding_output,
-            attention_mask=extended_attention_mask.detach(),
-            head_mask=head_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_extended_attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            band_mask=band_mask,
-            from_mask=from_mask,
-            to_mask=to_mask,
-            blocked_encoder_mask=blocked_encoder_mask,
-            return_dict=return_dict,
-        )
-        sequence_output = encoder_outputs
-        if self.out_mask:
-            if age_sex is not None:
-                logits, feature, mask = self.classifier(sequence_output, gate_mask, age_sex)
-            else:
-                logits, feature, mask = self.classifier(sequence_output, gate_mask)
-            if output_embedding:
-                return logits, gate[:, 0], feature, mask, embedding_output
-            else:
-                return logits, gate[:, 0], feature, mask
-        else:
-            if age_sex is not None:
-                logits, feature = self.classifier(sequence_output, gate_mask, age_sex)
-            else:
-                logits, feature = self.classifier(sequence_output, gate_mask)
-            if output_embedding:
-                return logits, gate[:, 0], feature, embedding_output
-            else:
-                return logits, gate[:, 0], feature
-
-    @staticmethod
-    def create_masks_for_block_sparse_attn(attention_mask: torch.Tensor, block_size: int):
-
-        batch_size, seq_length = attention_mask.size()
-        assert (
-                seq_length % block_size == 0
-        ), f"Sequence length must be multiple of block size, but sequence length is {seq_length}, while block size is {block_size}."
-
-        def create_band_mask_from_inputs(from_blocked_mask, to_blocked_mask):
-            """
-            Create 3D attention mask from a 2D tensor mask.
-            Args:
-                from_blocked_mask: 2D Tensor of shape [batch_size,
-                from_seq_length//from_block_size, from_block_size].
-                to_blocked_mask: int32 Tensor of shape [batch_size,
-                to_seq_length//to_block_size, to_block_size].
-            Returns:
-                float Tensor of shape [batch_size, 1, from_seq_length//from_block_size-4, from_block_size,
-                3*to_block_size].
-            """
-            exp_blocked_to_pad = torch.cat(
-                [to_blocked_mask[:, 1:-3], to_blocked_mask[:, 2:-2], to_blocked_mask[:, 3:-1]], dim=2
-            )
-            band_mask = torch.einsum("blq,blk->blqk", from_blocked_mask[:, 2:-2], exp_blocked_to_pad)
-            band_mask.unsqueeze_(1)
-            return band_mask
-
-        blocked_encoder_mask = attention_mask.view(batch_size, seq_length // block_size, block_size)
-        band_mask = create_band_mask_from_inputs(blocked_encoder_mask, blocked_encoder_mask)
-
-        from_mask = attention_mask.view(batch_size, 1, seq_length, 1)
-        to_mask = attention_mask.view(batch_size, 1, 1, seq_length)
-
-        return blocked_encoder_mask, band_mask, from_mask, to_mask
-
-    def _pad_to_block_size(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            token_type_ids=None,
-            position_ids=None,
-            inputs_embeds=None,
-            pad_token_id=None,
-    ):
-        """A helper function to pad tokens and mask to work with implementation of BigBird block-sparse attention."""
-        # padding
-        block_size = self.config.block_size
-
-        input_shape = input_ids.shape if input_ids is not None else inputs_embeds.shape
-        batch_size, seq_len = input_shape[:2]
-
-        padding_len = (block_size - seq_len % block_size) % block_size
-        if padding_len > 0:
-            # print(
-            #     f"Input ids are automatically padded from {seq_len} to {seq_len + padding_len} to be a multiple of "
-            #     f"`config.block_size`: {block_size}"
-            # )
-            if input_ids is not None:
-                input_ids = nn.functional.pad(input_ids, (0, padding_len), value=pad_token_id)
-            if position_ids is not None:
-                # pad with position_id = pad_token_id as in modeling_bigbird.BigBirdEmbeddings
-                position_ids = nn.functional.pad(position_ids, (0, padding_len), value=pad_token_id)
-            if inputs_embeds is not None:
-                input_ids_padding = inputs_embeds.new_full(
-                    (batch_size, padding_len),
-                    self.config.pad_token_id,
-                    dtype=torch.long,
-                )
-                inputs_embeds_padding = self.embeddings(input_ids_padding)
-                inputs_embeds = torch.cat([inputs_embeds, inputs_embeds_padding], dim=-2)
-            if attention_mask is not None:
-                attention_mask = nn.functional.pad(
-                    attention_mask, (0, padding_len), value=False
-                )  # no attention on the padding tokens
-            if token_type_ids is not None:
-                token_type_ids = nn.functional.pad(token_type_ids, (0, padding_len),
-                                                   value=0)  # pad with token_type_id = 0
-
-        return padding_len, input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds
-
 
 class Discriminator(nn.Module):
     def __init__(self, inchannels=512, feature_num=32):
