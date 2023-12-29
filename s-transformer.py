@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 
 #########S-Transformer#########
-class BigBird3(nn.Module):
+class S-Transformer(nn.Module):
     def __init__(self, config=None, add_pooling_layer=False, feature_num=128, fusion=False, out_mask=False,
                  as_disc=False, out_num=150):
         super().__init__()
