@@ -4,7 +4,7 @@ Source codes for the paper "A Sparse transformer for imaging-genetic association
 
 ## Framework Overview
 
-![Framework](path/to/framework.png)
+![Framework](framework.png)
 
 ## Training
 
