@@ -60,16 +60,16 @@ class MRIandGenedataset(Dataset):
         self.label_list = []
 
         assert k > 1
-        fold_size = len(self.cn_subject) // k  # 每份的个数:数据总条数/折数（组数）
-        fold_size2 = len(self.ad_subject) // k # 每份的个数:数据总条数/折数（组数）
-        fold_size3 = len(self.mci_subject) // k  # 每份的个数:数据总条数/折数（组数）
+        fold_size = len(self.cn_subject) // k  
+        fold_size2 = len(self.ad_subject) // k 
+        fold_size3 = len(self.mci_subject) // k 
 
         for j in range(k):
-            idx = slice(j * fold_size, (j + 1) * fold_size)  # slice(start,end,step)切片函数
-            idx2 = slice(j * fold_size2, (j + 1) * fold_size2)  # slice(start,end,step)切片函数
-            idx3 = slice(j * fold_size3, (j + 1) * fold_size3)  # slice(start,end,step)切片函数
+            idx = slice(j * fold_size, (j + 1) * fold_size)  
+            idx2 = slice(j * fold_size2, (j + 1) * fold_size2) 
+            idx3 = slice(j * fold_size3, (j + 1) * fold_size3)  
             if opt == "train":
-                if j is not i:  ###第i折作valid
+                if j is not i:  
                     add_list = self.cn_subject[idx]
                     add_list2 = self.ad_subject[idx2]
                     add_list3 = self.mci_subject[idx3]
