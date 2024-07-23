@@ -84,7 +84,7 @@ class MRIandGenedataset(Dataset):
                 self.label_list =  self.label_list + [0 for index in range(len(add_list))]
                 self.label_list =  self.label_list + [1 for index in range(len(add_list2))]
             else:
-                if j == i:  ###第i折作valid
+                if j == i:  
                     add_list = self.cn_subject[idx]
                     add_list2 = self.ad_subject[idx2]
                     add_list3 = self.mci_subject[idx3]
