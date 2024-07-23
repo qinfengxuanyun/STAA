@@ -1,6 +1,6 @@
-# A Sparse transformer for imaging-genetic association analysis of Alzheimer's disease and brain aging
+# A Sparse transformer for imaging genetic association analysis of Alzheimer's disease and brain aging
 
-Source codes for the paper "A Sparse transformer for imaging-genetic association analysis of Alzheimer's disease and brain aging".
+Source codes for the paper "A Sparse transformer for imaging genetic association analysis of Alzheimer's disease and brain aging".
 
 ## Task Overview
 
