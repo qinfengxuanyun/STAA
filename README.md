@@ -8,20 +8,23 @@ Source codes for the paper "A Sparse transformer for imaging-genetic association
 
 ## Training
 
-Explain the training process, including any preprocessing steps, hyperparameters, and how to start the training.
+Explain how to train the model
 
 ```bash
-# Start the training process
-python train.py --epochs 50 --batch_size 32 --learning_rate 0.001
+# The training process of MRI feature extraction
+python train_mri.py
+# The training process of MRI and SNP association
+python train_gene2mri.py
 ```
-
 ## Testing
 
 Explain how to test the model and evaluate its performance.
 
 ```bash
-# Run the testing script
-python test.py --model path/to/model --test_data path/to/test_data
+# The testing process of MRI feature extraction
+python test_mri.py
+# The testing process of MRI and SNP association
+python test_gene2mri.py
 ```
 
 ## License
